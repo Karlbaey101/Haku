@@ -28,3 +28,4 @@ issues/
 .idea/
 *.swp
 *.swo
+*.spec
