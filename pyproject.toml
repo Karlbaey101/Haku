@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "haku-md"
+version = "0.1.0"
+description = "Markdown-based GitHub issue manager"
+authors = [{name = "Karlbaey101", email = "Karlbaey101@outlook.com"}]
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/Karlbaey101/Homepageaku"
+Bug Tracker = "https://github.com/Karlbaey101/Haku/issues"
+
+[project.scripts]
+haku = "haku.cli:cli"
