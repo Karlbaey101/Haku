@@ -26,12 +26,17 @@ class HakuConfig:
         
     def load(self):
         if self.path.exists():
-            with open(self.path, "r") as f:
-                self.config = json.load(f)
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+            except UnicodeDecodeError:
+                # 尝试使用不同编码读取
+                with open(self.path, "r", encoding="latin-1") as f:
+                    self.config = json.load(f)
         return self.config
     
     def save(self):
-        with open(self.path, "w") as f:
+        with open(self.path, "w", encoding="utf-8") as f:
             json.dump(self.config, f, indent=2)
 
 def get_config(ctx):
@@ -91,31 +96,50 @@ def create_issue_file(ctx, title, labels, milestone, body=""):
         content += f"milestone: {milestone}\n"
     content += f"state: open\ncreated: {datetime.now().isoformat()}\n---\n\n{body}"
     
-    with open(filepath, "w") as f:
+    with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
     
     return filepath
 
 def parse_issue_metadata(filepath):
     """从Markdown文件中解析元数据"""
-    with open(filepath, "r") as f:
-        lines = f.readlines()
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except UnicodeDecodeError:
+        # 尝试使用其他编码读取
+        try:
+            with open(filepath, "r", encoding="latin-1") as f:
+                lines = f.readlines()
+        except Exception as e:
+            click.echo(f"Error reading file {filepath}: {str(e)}")
+            return None
     
     if not lines or not lines[0].startswith("---"):
         return None
     
     metadata = {}
     in_metadata = False
-    for line in lines:
+    body_lines = []
+    in_body = False
+    for i, line in enumerate(lines):
         if line.startswith("---"):
             if in_metadata:
-                break
-            in_metadata = True
-            continue
+                in_metadata = False
+                in_body = True
+                metadata["body_start"] = i + 1
+                continue
+            else:
+                in_metadata = True
+                continue
+        
         if in_metadata and ":" in line:
             key, value = line.split(":", 1)
             metadata[key.strip()] = value.strip()
+        elif in_body:
+            body_lines.append(line)
     
+    metadata["body"] = "".join(body_lines)
     return metadata
 
 def backup_issues(ctx):
@@ -124,8 +148,20 @@ def backup_issues(ctx):
     if not issues_dir.exists():
         return
     
-    backup_dir = Path(ctx.obj["root"]) / f"issues_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-    os.rename(issues_dir, backup_dir)
+    timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+    backup_dir = Path(ctx.obj["root"]) / f"issues_backup_{timestamp}"
+    backup_dir.mkdir(exist_ok=True)
+    
+    # 复制文件而不是移动
+    for file in issues_dir.glob("*.md"):
+        try:
+            with open(file, "r", encoding="utf-8") as src:
+                content = src.read()
+            with open(backup_dir / file.name, "w", encoding="utf-8") as dst:
+                dst.write(content)
+        except Exception as e:
+            click.echo(f"Error backing up {file.name}: {str(e)}")
+    
     click.echo(f"Created backup at: {backup_dir}")
 
 # CLI命令
@@ -206,9 +242,12 @@ def delete(ctx, issue_id):
     # 查找匹配的文件
     found = False
     for file in issues_dir.glob(f"{issue_id}.*.md"):
-        os.remove(file)
-        found = True
-        click.echo(f"Deleted local issue: {file.name}")
+        try:
+            os.remove(file)
+            found = True
+            click.echo(f"Deleted local issue: {file.name}")
+        except Exception as e:
+            click.echo(f"Error deleting issue: {str(e)}")
     
     if not found:
         raise click.ClickException(f"No local issue found with ID: {issue_id}")
@@ -247,55 +286,76 @@ def push(ctx, dry_run):
     
     # 处理新建/更新的issue
     for file in issues_dir.glob("*.md"):
-        meta = parse_issue_metadata(file)
-        if not meta:
-            click.echo(f"Skipping invalid issue file: {file.name}")
-            continue
-        
-        issue_data = {
-            "title": meta.get("title", "Untitled"),
-            "body": "\n".join(open(file).readlines()[meta.get("body_start", 0):]),
-            "labels": meta.get("labels", "").split(",") if meta.get("labels") else [],
-        }
-        
-        if meta.get("milestone"):
-            issue_data["milestone"] = meta.get("milestone")
-        
-        issue_id = meta.get("id", 0)
-        if issue_id == 0:  # 新建issue
-            if dry_run:
-                click.echo(f"[Dry Run] Would create issue: {issue_data['title']}")
-            else:
+        try:
+            meta = parse_issue_metadata(file)
+            if not meta:
+                click.echo(f"Skipping invalid issue file: {file.name}")
+                continue
+            
+            issue_data = {
+                "title": meta.get("title", "Untitled"),
+                "body": meta.get("body", ""),
+            }
+            
+            # 处理标签
+            labels = meta.get("labels", "")
+            if labels:
+                issue_data["labels"] = [label.strip() for label in labels.split(",") if label.strip()]
+            
+            # 处理里程碑（确保是整数）
+            milestone = meta.get("milestone")
+            if milestone:
                 try:
-                    url = f"{GITHUB_API}/repos/{repo}/issues"
-                    response = github_request("POST", url, token, issue_data).json()
-                    new_id = response["number"]
-                    
-                    # 更新本地文件
-                    new_name = f"{new_id}.{file.stem.split('.', 1)[1]}.md"
-                    new_path = file.parent / new_name
-                    os.rename(file, new_path)
-                    
-                    # 更新元数据
-                    with open(new_path, "r+") as f:
-                        content = f.read().replace("id: 0", f"id: {new_id}", 1)
-                        f.seek(0)
-                        f.write(content)
-                        f.truncate()
-                    
-                    click.echo(f"Created issue #{new_id}: {issue_data['title']}")
-                except Exception as e:
-                    click.echo(f"Error creating issue: {str(e)}")
-        else:  # 更新issue
-            if dry_run:
-                click.echo(f"[Dry Run] Would update issue #{issue_id}: {issue_data['title']}")
-            else:
-                try:
-                    url = f"{GITHUB_API}/repos/{repo}/issues/{issue_id}"
-                    github_request("PATCH", url, token, issue_data)
-                    click.echo(f"Updated issue #{issue_id}")
-                except Exception as e:
-                    click.echo(f"Error updating issue #{issue_id}: {str(e)}")
+                    issue_data["milestone"] = int(milestone)
+                except ValueError:
+                    click.echo(f"Invalid milestone value '{milestone}' in issue {file.name}. Skipping milestone.")
+            
+            issue_id = meta.get("id", "0")
+            try:
+                issue_id_int = int(issue_id)
+            except ValueError:
+                issue_id_int = 0
+            
+            if issue_id_int == 0:  # 新建issue
+                if dry_run:
+                    click.echo(f"[Dry Run] Would create issue: {issue_data['title']}")
+                else:
+                    try:
+                        url = f"{GITHUB_API}/repos/{repo}/issues"
+                        response = github_request("POST", url, token, issue_data).json()
+                        new_id = response["number"]
+                        
+                        # 更新本地文件
+                        new_name = f"{new_id}.{file.stem.split('.', 1)[1]}.md"
+                        new_path = file.parent / new_name
+                        
+                        # 更新元数据
+                        try:
+                            with open(file, "r", encoding="utf-8") as f:
+                                content = f.read()
+                            content = content.replace("id: 0", f"id: {new_id}", 1)
+                            
+                            with open(file, "w", encoding="utf-8") as f:
+                                f.write(content)
+                            
+                            os.rename(file, new_path)
+                            click.echo(f"Created issue #{new_id}: {issue_data['title']}")
+                        except Exception as e:
+                            click.echo(f"Error updating local file: {str(e)}")
+                    except Exception as e:
+                        click.echo(f"Error creating issue: {str(e)}")
+            else:  # 更新issue
+                if dry_run:
+                    click.echo(f"[Dry Run] Would update issue #{issue_id_int}: {issue_data['title']}")
+                else:
+                    try:
+                        url = f"{GITHUB_API}/repos/{repo}/issues/{issue_id_int}"
+                        github_request("PATCH", url, token, issue_data)
+                        click.echo(f"Updated issue #{issue_id_int}")
+                    except Exception as e:
+                        click.echo(f"Error updating issue #{issue_id_int}: {str(e)}")
+        except Exception as e:
+            click.echo(f"Error processing file {file.name}: {str(e)}")
     
     if not dry_run:
         config["last_sync"] = datetime.now().isoformat()
@@ -315,29 +375,46 @@ def pull(ctx, force):
     if not force:
         # 检查本地是否有未推送的修改
         for file in issues_dir.glob("*.md"):
-            meta = parse_issue_metadata(file)
-            if meta and meta.get("id", 0) == 0:
-                raise click.ClickException("Local changes detected. Use --force to overwrite or push first")
+            try:
+                meta = parse_issue_metadata(file)
+                if meta and meta.get("id", "0") == "0":
+                    raise click.ClickException("Local changes detected. Use --force to overwrite or push first")
+            except:
+                continue
     
     # 创建备份
     backup_issues(ctx)
-    issues_dir.mkdir(exist_ok=True)
+    
+    # 清空现有问题目录
+    for file in issues_dir.glob("*.md"):
+        try:
+            os.remove(file)
+        except:
+            pass
     
     # 获取所有issue
     page = 1
+    issue_count = 0
     while True:
         url = f"{GITHUB_API}/repos/{repo}/issues"
         params = {"state": "all", "per_page": 100, "page": page}
         try:
-            response = github_request("GET", url, token, params=params).json()
-            if not response:
+            response = github_request("GET", url, token, params=params)
+            issues = response.json()
+            
+            if not issues:
                 break
                 
-            for issue in response:
+            for issue in issues:
                 if "pull_request" in issue:  # 跳过PR
                     continue
                 
-                filename = f"{issue['number']}.{issue['title'].replace(' ', '_')}.md"
+                # 清理文件名中的无效字符
+                title = issue['title']
+                for char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|']:
+                    title = title.replace(char, '_')
+                
+                filename = f"{issue['number']}.{title.replace(' ', '_')}.md"
                 filepath = issues_dir / filename
                 
                 # 构建文件内容
@@ -350,11 +427,17 @@ def pull(ctx, force):
                     content += f"milestone: {issue['milestone']['number']}\n"
                 content += f"state: {issue['state']}\n"
                 content += f"created: {issue['created_at']}\n"
-                content += f"updated: {issue['updated_at']}\n---\n\n"
+                if issue.get("updated_at"):
+                    content += f"updated: {issue['updated_at']}\n"
+                content += f"---\n\n"
                 content += issue["body"] or ""
                 
-                with open(filepath, "w") as f:
-                    f.write(content)
+                try:
+                    with open(filepath, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    issue_count += 1
+                except Exception as e:
+                    click.echo(f"Error writing file {filename}: {str(e)}")
             
             page += 1
         except Exception as e:
@@ -363,7 +446,7 @@ def pull(ctx, force):
     
     config["last_sync"] = datetime.now().isoformat()
     save_config(ctx, config)
-    click.echo(f"Pulled issues to: {issues_dir}")
+    click.echo(f"Pulled {issue_count} issues to: {issues_dir}")
 
 @cli.command()
 @click.option("-l", "--local", "source", flag_value="local", default=True, help="List local issues")
@@ -400,19 +483,27 @@ def list(ctx, source, state, query):
     else:
         issues_dir = Path(ctx.obj["root"]) / ISSUES_DIR
         click.echo("Local Issues:")
+        issue_count = 0
         
         for file in issues_dir.glob("*.md"):
-            meta = parse_issue_metadata(file)
-            if not meta:
-                continue
-                
-            if state and meta.get("state") != state:
-                continue
-                
-            if query and query.lower() not in (meta.get("title") or "").lower():
-                continue
-                
-            click.echo(f"#{meta.get('id')} [{meta.get('state')}] {meta.get('title')}")
+            try:
+                meta = parse_issue_metadata(file)
+                if not meta:
+                    continue
+                    
+                if state and meta.get("state") != state:
+                    continue
+                    
+                if query and query.lower() not in (meta.get("title") or "").lower():
+                    continue
+                    
+                click.echo(f"#{meta.get('id')} [{meta.get('state')}] {meta.get('title')}")
+                issue_count += 1
+            except Exception as e:
+                click.echo(f"Error reading issue {file.name}: {str(e)}")
+        
+        if issue_count == 0:
+            click.echo("No issues found")
 
 if __name__ == "__main__":
     cli(obj={})
