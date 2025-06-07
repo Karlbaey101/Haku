@@ -1,8 +1,30 @@
-.venv/
-venv/
-env/
-.vscode/
+# Python
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+*.pyw
+*.pyz
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# Haku
+.hakuconfig
+issues/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
