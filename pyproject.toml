@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/Karlbaey101/Homepageaku"
+Homepage = "https://github.com/Karlbaey101/Haku"
 Bug-Tracker = "https://github.com/Karlbaey101/Haku/issues"
 
 [project.scripts]
