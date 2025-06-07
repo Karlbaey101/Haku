@@ -1,19 +1,32 @@
-import os
 import click
+import os
 from datetime import datetime
-from .models import Config, Issue
-from .core import HakuCore
-from .github_api import GitHubAPI
-from .utils import list_local_issues, extract_repo_info, sanitize_filename
+import requests
+import json
+from dataclasses import dataclass
+
+@dataclass
+class Config:
+    repo_url: str = ""
+    token: str = ""
+    issues_dir: str = "issues"
 
 class HakuContext:
     def __init__(self):
         self.config_file = ".hakuconfig"
-        self.config = Config.load(self.config_file)
-        self.core = HakuCore(self.config)
+        self.config = self._load_config()
         
+    def _load_config(self) -> Config:
+        if not os.path.exists(self.config_file):
+            return Config()
+        
+        with open(self.config_file, 'r') as f:
+            data = json.load(f)
+            return Config(**data)
+    
     def save_config(self):
-        self.config.save(self.config_file)
+        with open(self.config_file, 'w') as f:
+            json.dump(self.config.__dict__, f)
 
 pass_context = click.make_pass_decorator(HakuContext)
 
@@ -27,8 +40,13 @@ def cli(ctx):
 @pass_context
 def init(ctx):
     """Initialize a new Haku repository"""
-    success, message = ctx.obj.core.initialize_repo()
-    click.echo(message)
+    if os.path.exists(ctx.obj.config.issues_dir):
+        click.echo("Haku repository already initialized")
+        return
+    
+    os.makedirs(ctx.obj.config.issues_dir)
+    ctx.obj.save_config()
+    click.echo(f"Initialized empty Haku repository in {os.getcwd()}")
 
 @cli.command()
 @click.argument('url')
@@ -56,19 +74,64 @@ def token(ctx, token):
 @pass_context
 def create(ctx, title, body, label, milestone):
     """Create a new issue"""
-    try:
-        issue = ctx.obj.core.create_issue(title, body, list(label), milestone)
-        click.echo(f"Created issue #{issue.number}: {issue.title}")
-    except Exception as e:
-        click.echo(f"Error: {str(e)}")
+    issues_dir = ctx.obj.config.issues_dir
+    if not os.path.exists(issues_dir):
+        click.echo("Haku repository not initialized. Run 'haku init' first.")
+        return
+    
+    # Find the next issue number
+    existing_issues = [f for f in os.listdir(issues_dir) if f.endswith('.md')]
+    next_num = 1
+    if existing_issues:
+        nums = [int(f.split('.')[0]) for f in existing_issues]
+        next_num = max(nums) + 1
+    
+    # Create filename
+    safe_title = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in title)
+    filename = f"{next_num}.{safe_title}.md"
+    filepath = os.path.join(issues_dir, filename)
+    
+    # Create markdown content
+    content = f"""# {title}
+
+**Created**: {datetime.now().isoformat()}
+
+## Description
+
+{body}
+
+"""
+    if label:
+        content += f"\n## Labels\n{', '.join(label)}\n"
+    if milestone:
+        content += f"\n## Milestone\n{milestone}\n"
+    
+    with open(filepath, 'w') as f:
+        f.write(content)
+    
+    click.echo(f"Created issue #{next_num}: {filepath}")
 
 @cli.command()
 @click.argument('issue_number', type=int)
 @pass_context
 def delete(ctx, issue_number):
     """Delete an issue locally"""
-    success, message = ctx.obj.core.delete_issue(issue_number)
-    click.echo(message)
+    issues_dir = ctx.obj.config.issues_dir
+    if not os.path.exists(issues_dir):
+        click.echo("Haku repository not initialized. Run 'haku init' first.")
+        return
+    
+    # Find the issue file
+    matching_files = [f for f in os.listdir(issues_dir) 
+                     if f.startswith(f"{issue_number}.") and f.endswith('.md')]
+    
+    if not matching_files:
+        click.echo(f"No issue found with number {issue_number}")
+        return
+    
+    filepath = os.path.join(issues_dir, matching_files[0])
+    os.remove(filepath)
+    click.echo(f"Deleted issue #{issue_number}")
 
 @cli.command()
 @pass_context
@@ -78,29 +141,66 @@ def push(ctx):
         click.echo("Repository not linked or token not set. Use 'haku link' and 'haku token' first.")
         return
     
-    try:
-        github_api = GitHubAPI(ctx.obj.config)
-        issues = ctx.obj.core.list_local_issues()
-        
-        for issue in issues:
-            try:
-                # 检查 issue 是否已存在
-                try:
-                    remote_issue = github_api.get_issue(issue.number)
-                    # 更新现有 issue
-                    result = github_api.update_issue(issue)
-                    action = "updated"
-                except:
-                    # 创建新 issue
-                    result = github_api.create_issue(issue)
-                    action = "created"
-                
-                click.echo(f"Issue #{issue.number} {action} successfully: {issue.title}")
-            except Exception as e:
-                click.echo(f"Failed to push issue #{issue.number}: {str(e)}")
+    # Extract owner and repo from URL
+    parts = ctx.obj.config.repo_url.strip('/').split('/')
+    if len(parts) < 2:
+        click.echo("Invalid repository URL format")
+        return
     
-    except Exception as e:
-        click.echo(f"Error: {str(e)}")
+    owner, repo = parts[-2], parts[-1]
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    headers = {
+        "Authorization": f"token {ctx.obj.config.token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    issues_dir = ctx.obj.config.issues_dir
+    if not os.path.exists(issues_dir):
+        click.echo("No issues directory found")
+        return
+    
+    for filename in os.listdir(issues_dir):
+        if not filename.endswith('.md'):
+            continue
+        
+        issue_num = filename.split('.')[0]
+        filepath = os.path.join(issues_dir, filename)
+        
+        with open(filepath, 'r') as f:
+            content = f.read()
+        
+        # Parse content
+        lines = content.split('\n')
+        title = lines[0][2:].strip()  # Remove '# '
+        body = '\n'.join(lines[3:]).strip()  # Skip header lines
+        
+        # Check if issue already exists
+        exists = False
+        if issue_num.isdigit():
+            response = requests.get(f"{api_url}/{issue_num}", headers=headers)
+            exists = response.status_code == 200
+        
+        if exists:
+            # Update existing issue
+            response = requests.patch(
+                f"{api_url}/{issue_num}",
+                headers=headers,
+                json={"title": title, "body": body}
+            )
+            action = "updated"
+        else:
+            # Create new issue
+            response = requests.post(
+                api_url,
+                headers=headers,
+                json={"title": title, "body": body}
+            )
+            action = "created"
+        
+        if response.status_code in (200, 201):
+            click.echo(f"Issue {action} successfully: {title}")
+        else:
+            click.echo(f"Failed to push issue: {response.json().get('message', 'Unknown error')}")
 
 @cli.command()
 @pass_context
@@ -110,41 +210,56 @@ def pull(ctx):
         click.echo("Repository not linked or token not set. Use 'haku link' and 'haku token' first.")
         return
     
-    try:
-        github_api = GitHubAPI(ctx.obj.config)
-        issues = github_api.list_issues(state="all")
-        
-        # 确保 issues 目录存在
-        issues_dir = ctx.obj.config.issues_dir
-        if not os.path.exists(issues_dir):
-            os.makedirs(issues_dir)
-        
-        for issue_data in issues:
-            # 创建 issue 对象
-            issue = Issue(
-                number=issue_data['number'],
-                title=issue_data['title'],
-                body=issue_data['body'] or "",
-                state=issue_data['state'],
-                labels=[label['name'] for label in issue_data.get('labels', [])],
-                milestone=issue_data.get('milestone', {}).get('title'),
-                created_at=issue_data['created_at']
-            )
-            
-            # 生成文件名
-            safe_title = sanitize_filename(issue.title)
-            filename = f"{issue.number}.{safe_title}.md"
-            filepath = os.path.join(issues_dir, filename)
-            issue.filepath = filepath
-            
-            # 写入文件
-            with open(filepath, 'w') as f:
-                f.write(issue.to_markdown())
-            
-            click.echo(f"Pulled issue #{issue.number}: {issue.title}")
+    # Extract owner and repo from URL
+    parts = ctx.obj.config.repo_url.strip('/').split('/')
+    if len(parts) < 2:
+        click.echo("Invalid repository URL format")
+        return
     
-    except Exception as e:
-        click.echo(f"Error: {str(e)}")
+    owner, repo = parts[-2], parts[-1]
+    api_url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+    headers = {
+        "Authorization": f"token {ctx.obj.config.token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    
+    # Create issues directory if it doesn't exist
+    issues_dir = ctx.obj.config.issues_dir
+    if not os.path.exists(issues_dir):
+        os.makedirs(issues_dir)
+    
+    # Get all issues from GitHub
+    response = requests.get(api_url, headers=headers)
+    if response.status_code != 200:
+        click.echo(f"Failed to fetch issues: {response.json().get('message', 'Unknown error')}")
+        return
+    
+    issues = response.json()
+    for issue in issues:
+        filename = f"{issue['number']}.{issue['title']}.md"
+        safe_filename = "".join(c if c.isalnum() or c in (' ', '-', '_') else '_' for c in filename)
+        filepath = os.path.join(issues_dir, safe_filename)
+        
+        # Prepare content
+        content = f"""# {issue['title']}
+
+**Created**: {issue['created_at']}
+**State**: {'open' if issue['state'] == 'open' else 'closed'}
+
+## Description
+
+{issue['body']}
+
+"""
+        if issue.get('labels'):
+            content += f"\n## Labels\n{', '.join(label['name'] for label in issue['labels'])}\n"
+        if issue.get('milestone'):
+            content += f"\n## Milestone\n{issue['milestone']['title']}\n"
+        
+        with open(filepath, 'w') as f:
+            f.write(content)
+        
+        click.echo(f"Pulled issue #{issue['number']}: {issue['title']}")
 
 @cli.command()
 @click.option('-r', '--remote', is_flag=True, help='List remote issues')
@@ -158,42 +273,81 @@ def list(ctx, remote, local, open, closed, query):
     if not remote and not local:
         local = True  # Default to local
     
-    state_filter = None
-    if open:
-        state_filter = "open"
-    elif closed:
-        state_filter = "closed"
-    
     if local:
-        try:
-            issues = ctx.obj.core.list_local_issues(state_filter, query)
-            click.echo("Local Issues:")
-            click.echo("------------")
-            for issue in issues:
-                click.echo(f"#{issue.number}: {issue.title} [{issue.state}]")
-        except Exception as e:
-            click.echo(f"Error listing local issues: {str(e)}")
+        issues_dir = ctx.obj.config.issues_dir
+        if not os.path.exists(issues_dir):
+            click.echo("No issues directory found")
+            return
+        
+        click.echo("Local Issues:")
+        click.echo("------------")
+        for filename in sorted(os.listdir(issues_dir)):
+            if not filename.endswith('.md'):
+                continue
+            
+            parts = filename.split('.')
+            if len(parts) < 3:
+                continue
+            
+            issue_num = parts[0]
+            title = '.'.join(parts[1:-1])  # Handle titles with dots
+            
+            # Read state from file
+            filepath = os.path.join(issues_dir, filename)
+            with open(filepath, 'r') as f:
+                lines = f.readlines()
+                state = "unknown"
+                for line in lines:
+                    if line.startswith("**State**: "):
+                        state = line.split(": ")[1].strip()
+                        break
+            
+            # Apply filters
+            if open and state != 'open':
+                continue
+            if closed and state != 'closed':
+                continue
+            if query and query.lower() not in title.lower():
+                continue
+            
+            click.echo(f"#{issue_num}: {title} [{state}]")
     
     if remote:
         if not ctx.obj.config.repo_url or not ctx.obj.config.token:
             click.echo("Repository not linked or token not set. Use 'haku link' and 'haku token' first.")
             return
         
-        try:
-            github_api = GitHubAPI(ctx.obj.config)
-            state = "all"
-            if open:
-                state = "open"
-            elif closed:
-                state = "closed"
-            
-            issues = github_api.list_issues(state=state, query=query)
-            click.echo("\nRemote Issues:")
-            click.echo("-------------")
-            for issue in issues:
-                click.echo(f"#{issue['number']}: {issue['title']} [{issue['state']}]")
-        except Exception as e:
-            click.echo(f"Error listing remote issues: {str(e)}")
+        # Extract owner and repo from URL
+        parts = ctx.obj.config.repo_url.strip('/').split('/')
+        if len(parts) < 2:
+            click.echo("Invalid repository URL format")
+            return
+        
+        owner, repo = parts[-2], parts[-1]
+        api_url = f"https://api.github.com/repos/{owner}/{repo}/issues"
+        headers = {
+            "Authorization": f"token {ctx.obj.config.token}",
+            "Accept": "application/vnd.github.v3+json"
+        }
+        
+        params = {}
+        if open:
+            params['state'] = 'open'
+        if closed:
+            params['state'] = 'closed'
+        if query:
+            params['q'] = f'repo:{owner}/{repo} {query} in:title,body'
+        
+        response = requests.get(api_url, headers=headers, params=params)
+        if response.status_code != 200:
+            click.echo(f"Failed to fetch issues: {response.json().get('message', 'Unknown error')}")
+            return
+        
+        issues = response.json()
+        click.echo("\nRemote Issues:")
+        click.echo("-------------")
+        for issue in issues:
+            click.echo(f"#{issue['number']}: {issue['title']} [{issue['state']}]")
 
 if __name__ == '__main__':
     cli()

@@ -17,7 +17,14 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://github.com/Karlbaey101/Homepageaku"
-Bug Tracker = "https://github.com/Karlbaey101/Haku/issues"
+Bug-Tracker = "https://github.com/Karlbaey101/Haku/issues"
 
 [project.scripts]
 haku = "haku.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["haku*"]
+
+[tool.setuptools.package-dir]
+haku = "/haku"
